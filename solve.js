@@ -583,9 +583,19 @@ function renderMarkdown(src, env, slugCache) {
       body.push(trimST(l));
       pos = nextPos(src, pos);
     }
-    const phtml = inlineStr(body.join('\n'), env);
-    if (excerpt === null) excerpt = phtml;
-    buf.push('<p>', phtml, '</p>\n');
+    // The first paragraph is also the excerpt, so it needs its HTML as a
+    // string; later paragraphs inline straight into the page buffer, which
+    // joins to exactly the same text ('<p>' + html + '</p>\n').
+    const text = body.join('\n');
+    if (excerpt === null) {
+      const phtml = inlineStr(text, env);
+      excerpt = phtml;
+      buf.push('<p>', phtml, '</p>\n');
+    } else {
+      buf.push('<p>');
+      inline(text, env, buf);
+      buf.push('</p>\n');
+    }
   }
   return { html: buf.join(''), toc, excerpt: excerpt ?? '' };
 }
@@ -692,6 +702,71 @@ function parseTemplate(name, src) {
   return root.body;
 }
 
+// Free-variable analysis for include memoisation. A template whose free
+// variables are all among the per-case constants (site, tags, recent)
+// renders the same string in every page render of the case, so its
+// rendering can be computed once per case (per include depth, since the
+// depth guard can cut nested includes) and reused; anything else renders
+// normally. Computed by fixpoint iteration so include cycles stay safe.
+// Guard: if any template anywhere binds a loop variable named site, tags
+// or recent, a loop could shadow a constant and memoisation is disabled
+// for the whole run (the competition's generator only ever binds p, t, h).
+const CASE_CONSTANTS = new Set(['site', 'tags', 'recent']);
+
+function walkFree(nodes, bound, acc, free, loopNames) {
+  for (const n of nodes) {
+    if (n.k === 1 || n.k === 2) {
+      if (!bound.has(n.path[0])) acc.add(n.path[0]);
+    } else if (n.k === 4) {
+      if (!bound.has(n.path[0])) acc.add(n.path[0]);
+      if (n.then) walkFree(n.then, bound, acc, free, loopNames);
+      if (n.els) walkFree(n.els, bound, acc, free, loopNames);
+    } else if (n.k === 3) {
+      if (!bound.has(n.path[0])) acc.add(n.path[0]);
+      loopNames.add(n.name);
+      const b2 = new Set(bound);
+      b2.add(n.name);
+      b2.add('loop');
+      walkFree(n.body, b2, acc, free, loopNames);
+    } else if (n.k === 5) {
+      const sub = free.get(n.name);
+      if (sub !== undefined) for (const v of sub) if (!bound.has(v)) acc.add(v);
+    }
+  }
+}
+
+// Returns { memoizable: Set<name>, objVar: Map<name, varName> } — the
+// templates safe to memoise: memoizable renders only from the per-case
+// constants; objVar names the templates whose free variables are the
+// constants plus exactly one varying object (never `loop`, whose fields
+// mutate per iteration), so their rendering can be cached per object.
+function analyseTemplates(templates) {
+  const free = new Map();
+  for (const name of templates.keys()) free.set(name, new Set());
+  const loopNames = new Set();
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const [name, nodes] of templates) {
+      const acc = free.get(name);
+      const before = acc.size;
+      walkFree(nodes, new Set(), acc, free, loopNames);
+      if (acc.size !== before) changed = true;
+    }
+  }
+  const shadowed = [...loopNames].some((n) => CASE_CONSTANTS.has(n));
+  const memoizable = new Set();
+  const objVar = new Map();
+  if (!shadowed) {
+    for (const [name, vars] of free) {
+      const varying = [...vars].filter((v) => !CASE_CONSTANTS.has(v));
+      if (varying.length === 0) memoizable.add(name);
+      else if (varying.length === 1 && varying[0] !== 'loop') objVar.set(name, varying[0]);
+    }
+  }
+  return { memoizable, objVar };
+}
+
 /** The value at `path` in merged scope S (first name an own property of S). */
 function lk(S, path) {
   let v = Object.hasOwn(S, path[0]) ? S[path[0]] : undefined;
@@ -751,7 +826,43 @@ function renderNodes(nodes, S, ctx, depth, buf) {
       }
     } else {
       const nodes2 = ctx.templates.get(n.name);
-      if (nodes2 !== undefined && depth < 8) renderNodes(nodes2, S, ctx, depth + 1, buf);
+      if (nodes2 !== undefined && depth < 8) {
+        if (ctx.memoizable.has(n.name)) {
+          // Renders only from the per-case constants, so the string is the
+          // same at every include site; cache it per include depth.
+          const key = `${n.name}@${depth + 1}`;
+          let s = ctx.includeCache.get(key);
+          if (s === undefined) {
+            const b2 = [];
+            renderNodes(nodes2, S, ctx, depth + 1, b2);
+            s = b2.join('');
+            ctx.includeCache.set(key, s);
+          }
+          buf.push(s);
+        } else if (ctx.objVar.has(n.name)) {
+          // Renders only from the constants plus one varying object; the
+          // object is never mutated after it is built (cards are built once
+          // and pageOf mutates a fresh card, not the cached one), so the
+          // string is the same every time this object is rendered.
+          const v = S[ctx.objVar.get(n.name)];
+          let done = false;
+          if (v !== null && typeof v === 'object') {
+            const key = `${n.name}@${depth + 1}`;
+            let perObj = ctx.objCache.get(v);
+            if (perObj === undefined) { perObj = new Map(); ctx.objCache.set(v, perObj); }
+            let s = perObj.get(key);
+            if (s === undefined) {
+              const b2 = [];
+              renderNodes(nodes2, S, ctx, depth + 1, b2);
+              s = b2.join('');
+              perObj.set(key, s);
+            }
+            buf.push(s);
+            done = true;
+          }
+          if (!done) renderNodes(nodes2, S, ctx, depth + 1, buf);
+        } else renderNodes(nodes2, S, ctx, depth + 1, buf);
+      }
     }
   }
 }
@@ -960,7 +1071,8 @@ export function run(input) {
   const site = { title: input.site.title, base_url: base };
   const allTags = tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = posts.slice(0, input.site.recent).map((p) => cards.get(p));
-  const ctx = { templates, escCache };
+  const { memoizable, objVar } = analyseTemplates(templates);
+  const ctx = { templates, escCache, memoizable, objVar, includeCache: new Map(), objCache: new WeakMap() };
   const output = {};
   const render = (name, vars) => {
     const nodes = templates.get(name);

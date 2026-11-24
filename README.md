@@ -17,6 +17,7 @@ The reference build is re-implemented with the same observable behaviour, but wi
 - **Slugs**: cached per case (titles, tags, and headings repeat a lot); pure-ASCII inputs skip the NFKD normalisation.
 - **Templates**: parsed once per case into a compact node tree and rendered with a merged scope object — a `for` loop binds its variable (and `loop`) in place, saving and restoring the previous value, instead of allocating a scope object and closure per item.
 - **Reading time**: each source's word count is computed once and memoised.
+- **Template includes**: a free-variable analysis proves which includes render only from the per-case constants (`site`, `tags`, `recent`) or from one immutable object (a post card); those renderings are computed once per case (or once per object) and reused, so headers, footers, navigation and cards are not re-rendered for every page.
 
 Everything is deterministic: no clock, no randomness, no environment reads, and nothing is carried from one case to the next (all caches live inside one `run()` call).
 
