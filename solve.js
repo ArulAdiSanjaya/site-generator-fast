@@ -45,6 +45,16 @@ function slugifyRaw(text) {
   let ascii = true;
   for (let i = 0; i < text.length; i++) if (text.charCodeAt(i) > 127) { ascii = false; break; }
   if (!ascii) plain = text.normalize('NFKD').replace(MARK_RE, '');
+  if (ascii) {
+    // ASCII fast path: the per-character loop below classifies exactly the
+    // same way (a-z0-9 kept, A-Z lowercased, every other run one '-'), so a
+    // regex does the same work in native code. Leading/trailing runs are
+    // dropped, then the 64-char cut and trailing-dash strip, as in the loop.
+    let s = text.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+    if (s.charCodeAt(0) === 45) s = s.slice(1);
+    s = s.slice(0, 64).replace(/-+$/, '');
+    return s === '' ? 'untitled' : s;
+  }
   let out = '';
   let gap = false;
   for (const ch of plain) {
@@ -77,24 +87,23 @@ function longDate(date) {
   return `${d} ${MONTHS[m - 1]} ${y}`;
 }
 
-function isWsCode(c) {
-  return c === 9 || c === 10 || c === 11 || c === 12 || c === 13 || c === 32 || c === 160 || c === 5760 ||
-    (c >= 8192 && c <= 8202) || c === 8232 || c === 8233 || c === 8239 || c === 8287 || c === 12288 || c === 65279;
-}
+const WS_TABLE = new Uint8Array(65536);
+for (const c of [9, 10, 11, 12, 13, 32, 160, 5760, 8232, 8233, 8239, 8287, 12288, 65279]) WS_TABLE[c] = 1;
+for (let c = 8192; c <= 8202; c++) WS_TABLE[c] = 1;
 
 // Count runs of non-whitespace (same as /\S+/g) without building a match array.
 function wordsOf(text) {
   let n = 0;
   let inWord = false;
   for (let i = 0; i < text.length; i++) {
-    if (isWsCode(text.charCodeAt(i))) inWord = false;
+    if (WS_TABLE[text.charCodeAt(i)]) inWord = false;
     else if (!inWord) { inWord = true; n++; }
   }
   return n;
 }
 
-function resolvePath(dir, rel) {
-  const parts = dir === '' ? [] : dir.split('/');
+function resolveFrom(parts0, rel) {
+  const parts = parts0.slice();
   let start = 0;
   while (start <= rel.length) {
     const slash = rel.indexOf('/', start);
@@ -300,8 +309,10 @@ function findSingleStar(s, from) {
   return -1;
 }
 
-function inline(s, env) {
-  let out = '';
+// Inline Markdown into `buf` (array of strings); callers needing a string
+// join the buffer. Same output as building one string, without the
+// intermediate strings at every nesting level.
+function inline(s, env, buf) {
   let i = 0;
   const n = s.length;
   const re = /[\\`*\[&<>"']/g;
@@ -312,21 +323,21 @@ function inline(s, env) {
     re.lastIndex = i;
     const mt = re.exec(s);
     const j = mt === null ? n : mt.index;
-    if (j > i) out += s.slice(i, j);
+    if (j > i) buf.push(s.slice(i, j));
     if (j >= n) break;
     i = j;
     const c = s[i];
     if (c === '&' || c === '<' || c === '>' || c === '"' || c === "'") {
-      out += esc1(c);
+      buf.push(esc1(c));
       i++;
       continue;
     }
     if (c === '\\') {
       if (i + 1 < n && ESCAPABLE.has(s[i + 1])) {
-        out += esc1(s[i + 1]);
+        buf.push(esc1(s[i + 1]));
         i += 2;
       } else {
-        out += '\\';
+        buf.push('\\');
         i++;
       }
       continue;
@@ -334,10 +345,10 @@ function inline(s, env) {
     if (c === '`') {
       const close = s.indexOf('`', i + 1);
       if (close > i + 1) {
-        out += `<code>${escapeHtml(s.slice(i + 1, close), null)}</code>`;
+        buf.push('<code>', escapeHtml(s.slice(i + 1, close), null), '</code>');
         i = close + 1;
       } else {
-        out += '`';
+        buf.push('`');
         i++;
       }
       continue;
@@ -346,20 +357,24 @@ function inline(s, env) {
       if (s[i + 1] === '*') {
         const close = findUnescaped(s, '**', i + 2);
         if (close > i + 2) {
-          out += `<strong>${inline(s.slice(i + 2, close), env)}</strong>`;
+          buf.push('<strong>');
+          inline(s.slice(i + 2, close), env, buf);
+          buf.push('</strong>');
           i = close + 2;
         } else {
-          out += '**';
+          buf.push('**');
           i += 2;
         }
         continue;
       }
       const close = findSingleStar(s, i + 1);
       if (close > i + 1) {
-        out += `<em>${inline(s.slice(i + 1, close), env)}</em>`;
+        buf.push('<em>');
+        inline(s.slice(i + 1, close), env, buf);
+        buf.push('</em>');
         i = close + 1;
       } else {
-        out += '*';
+        buf.push('*');
         i++;
       }
       continue;
@@ -369,14 +384,21 @@ function inline(s, env) {
     const m = closeBracket !== -1 && s[closeBracket + 1] === '(' ? s.indexOf(')', closeBracket + 2) : -1;
     const target = m === -1 ? '' : s.slice(closeBracket + 2, m);
     if (target !== '' && !/\s/.test(target)) {
-      out += `<a href="${escapeHtml(env.link(target), null)}">${inline(s.slice(i + 1, closeBracket), env)}</a>`;
+      buf.push('<a href="', escapeHtml(env.link(target), null), '">');
+      inline(s.slice(i + 1, closeBracket), env, buf);
+      buf.push('</a>');
       i = m + 1;
       continue;
     }
-    out += '[';
+    buf.push('[');
     i++;
   }
-  return out;
+}
+
+function inlineStr(s, env) {
+  const buf = [];
+  inline(s, env, buf);
+  return buf.join('');
 }
 
 // Block-level helpers (line is a plain string, no trailing '\n').
@@ -433,7 +455,7 @@ function endsParagraph(line) {
 
 function renderMarkdown(src, env, slugCache) {
   const ids = new Set();
-  let html = '';
+  const buf = [];
   const toc = [];
   let excerpt = null;
   let pos = 0;
@@ -456,9 +478,9 @@ function renderMarkdown(src, env, slugCache) {
       }
       pos = nextPos(src, pos);
       const cls = lang === '' ? '' : ` class="language-${escapeHtml(lang, null)}"`;
-      html += `<pre><code${cls}>`;
-      for (const l of body) html += `${escapeHtml(l, null)}\n`;
-      html += '</code></pre>\n';
+      buf.push(`<pre><code${cls}>`);
+      for (const l of body) buf.push(escapeHtml(l, null), '\n');
+      buf.push('</code></pre>\n');
       continue;
     }
     const heading = headingOf(line);
@@ -466,14 +488,14 @@ function renderMarkdown(src, env, slugCache) {
       let slug = slugCache.get(heading.text);
       if (slug === undefined) { slug = slugifyRaw(heading.text); slugCache.set(heading.text, slug); }
       const id = uniqueSlug(slug, ids);
-      const hhtml = inline(heading.text, env);
-      html += `<h${heading.depth} id="${id}">${hhtml}</h${heading.depth}>\n`;
+      const hhtml = inlineStr(heading.text, env);
+      buf.push(`<h${heading.depth} id="${id}">`, hhtml, `</h${heading.depth}>\n`);
       if (heading.depth === 2 || heading.depth === 3) toc.push({ level: heading.depth, id, html: hhtml });
       pos = nextPos(src, pos);
       continue;
     }
     if (isHr(line)) {
-      html += '<hr>\n';
+      buf.push('<hr>\n');
       pos = nextPos(src, pos);
       continue;
     }
@@ -488,7 +510,12 @@ function renderMarkdown(src, env, slugCache) {
         if (t !== '') qlines.push(t);
         pos = nextPos(src, pos);
       }
-      html += qlines.length === 0 ? '<blockquote>\n</blockquote>\n' : `<blockquote>\n<p>${inline(qlines.join('\n'), env)}</p>\n</blockquote>\n`;
+      if (qlines.length === 0) buf.push('<blockquote>\n</blockquote>\n');
+      else {
+        buf.push('<blockquote>\n<p>');
+        inline(qlines.join('\n'), env, buf);
+        buf.push('</p>\n</blockquote>\n');
+      }
       continue;
     }
     // list?
@@ -538,9 +565,13 @@ function renderMarkdown(src, env, slugCache) {
       }
       const tag = isOrdered ? 'ol' : 'ul';
       const open = isOrdered && orderedStart !== 1 ? `<ol start="${orderedStart}">` : `<${tag}>`;
-      html += `${open}\n`;
-      for (const parts of items) html += `<li>${inline(parts.join('\n'), env)}</li>\n`;
-      html += `</${tag}>\n`;
+      buf.push(`${open}\n`);
+      for (const parts of items) {
+        buf.push('<li>');
+        inline(parts.join('\n'), env, buf);
+        buf.push('</li>\n');
+      }
+      buf.push(`</${tag}>\n`);
       continue;
     }
     // paragraph
@@ -552,11 +583,11 @@ function renderMarkdown(src, env, slugCache) {
       body.push(trimST(l));
       pos = nextPos(src, pos);
     }
-    const phtml = inline(body.join('\n'), env);
+    const phtml = inlineStr(body.join('\n'), env);
     if (excerpt === null) excerpt = phtml;
-    html += `<p>${phtml}</p>\n`;
+    buf.push('<p>', phtml, '</p>\n');
   }
-  return { html, toc, excerpt: excerpt ?? '' };
+  return { html: buf.join(''), toc, excerpt: excerpt ?? '' };
 }
 
 // ---------------------------------------------------------------- templates
@@ -686,20 +717,19 @@ function truthy(v) {
   return v !== undefined && v !== null && v !== false && v !== '' && v !== 0;
 }
 
-function renderNodes(nodes, S, ctx, depth) {
-  let out = '';
+function renderNodes(nodes, S, ctx, depth, buf) {
   for (let ni = 0; ni < nodes.length; ni++) {
     const n = nodes[ni];
     if (n.k === 0) {
-      out += n.text;
+      buf.push(n.text);
     } else if (n.k === 1) {
-      out += escapeHtml(textOf(lk(S, n.path)), ctx.escCache);
+      buf.push(escapeHtml(textOf(lk(S, n.path)), ctx.escCache));
     } else if (n.k === 2) {
-      out += textOf(lk(S, n.path));
+      buf.push(textOf(lk(S, n.path)));
     } else if (n.k === 4) {
       const v = truthy(lk(S, n.path));
       const branch = v !== n.not ? n.then : n.els;
-      if (branch !== null) out += renderNodes(branch, S, ctx, depth);
+      if (branch !== null) renderNodes(branch, S, ctx, depth, buf);
     } else if (n.k === 3) {
       const xs = lk(S, n.path);
       if (Array.isArray(xs)) {
@@ -714,17 +744,16 @@ function renderNodes(nodes, S, ctx, depth) {
           loop.index = k + 1;
           loop.first = k === 0;
           loop.last = k === xs.length - 1;
-          out += renderNodes(n.body, S, ctx, depth);
+          renderNodes(n.body, S, ctx, depth, buf);
         }
         if (sh) S[n.name] = sv; else S[n.name] = undefined;
         if (slh) S.loop = sl; else S.loop = undefined;
       }
     } else {
       const nodes2 = ctx.templates.get(n.name);
-      if (nodes2 !== undefined && depth < 8) out += renderNodes(nodes2, S, ctx, depth + 1);
+      if (nodes2 !== undefined && depth < 8) renderNodes(nodes2, S, ctx, depth + 1, buf);
     }
   }
-  return out;
 }
 
 // ---------------------------------------------------------------- build
@@ -765,7 +794,7 @@ export function run(input) {
   const statics = [];
   const files = [...input.files].sort((x, y) => byCodeUnits(x.path, y.path));
   for (const f of files) {
-    if (f.path.endsWith('.md')) sources.push({ path: f.path, text: f.content.replace(/\r\n?/g, '\n') });
+    if (f.path.endsWith('.md')) sources.push({ path: f.path, text: f.content.indexOf('\r') === -1 ? f.content : f.content.replace(/\r\n?/g, '\n') });
     else statics.push({ path: f.path, content: f.content });
   }
 
@@ -828,13 +857,14 @@ export function run(input) {
   const broken = new Set();
   for (const s of kept) {
     const dir = dirOf(s.path);
+    const dirParts = dir === '' ? [] : dir.split('/');
     const env = {
       link: (target) => {
         if (isScheme(target) || target.startsWith('/') || target.startsWith('#')) return target;
         const hash = target.indexOf('#');
         const rel = hash === -1 ? target : target.slice(0, hash);
         const frag = hash === -1 ? '' : target.slice(hash);
-        const path = rel === '' ? null : resolvePath(dir, rel);
+        const path = rel === '' ? null : resolveFrom(dirParts, rel);
         if (path !== null && bySource.has(path)) return `${bySource.get(path).url}${frag}`;
         if (path !== null && staticPaths.has(path)) return `${base}/${path}${frag}`;
         broken.add(`broken-link ${s.path} -> ${target}`);
@@ -892,6 +922,13 @@ export function run(input) {
 
   const linkOf = (s) => (s === null ? null : { title: s.data.title, url: s.url, date: s.data.date ?? '', date_long: s.data.date === undefined ? '' : longDate(s.data.date) });
 
+  // The tag objects a card carries are read-only for the templates, so one
+  // array per source is shared by every card built from it.
+  function tagArrOf(s) {
+    if (s.tagArr === undefined) s.tagArr = s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url }));
+    return s.tagArr;
+  }
+
   function cardOf(s) {
     if (s.readingMinutes === undefined) s.readingMinutes = Math.max(1, Math.ceil(wordsOf(s.body) / 200));
     return {
@@ -902,7 +939,7 @@ export function run(input) {
       summary: s.data.summary ?? '',
       excerpt: s.excerpt,
       reading_minutes: s.readingMinutes,
-      tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
+      tags: tagArrOf(s),
     };
   }
 
@@ -929,7 +966,9 @@ export function run(input) {
     const nodes = templates.get(name);
     if (nodes === undefined) return null;
     const S = { site, tags: allTags, recent, ...vars };
-    return renderNodes(nodes, S, ctx, 0);
+    const buf = [];
+    renderNodes(nodes, S, ctx, 0, buf);
+    return buf.join('');
   };
   for (const s of kept) output[`${s.outDir}/index.html`] = render(s.layout, { page: pageOf(s) });
   const per = input.site.per_page;
