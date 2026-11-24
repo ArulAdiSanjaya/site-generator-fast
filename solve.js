@@ -497,16 +497,6 @@ function isHrRange(src, s, e) {
   return true;
 }
 
-function endsParaRange(src, s, e) {
-  if (s === e) return true;
-  const c0 = src.charCodeAt(s);
-  if (c0 === 32 || c0 === 9) return isBlankRange(src, s, e);
-  if (c0 === 96) return fenceLangRange(src, s, e) !== null; // '`'
-  if (c0 === 35) return headingRange(src, s, e) !== null; // '#'
-  if (c0 === 45 || c0 === 42) return isHrRange(src, s, e); // '-' or '*'
-  return false;
-}
-
 function renderMarkdown(src, env, slugCache) {
   const ids = new Set();
   const buf = [];
@@ -520,7 +510,8 @@ function renderMarkdown(src, env, slugCache) {
       pos = end + 1;
       continue;
     }
-    const lang = fenceLangRange(src, pos, end);
+    const c0 = src.charCodeAt(pos);
+    const lang = c0 === 96 ? fenceLangRange(src, pos, end) : null;
     if (lang !== null) {
       // The fence body is one contiguous range of src (lines plus their
       // '\n' separators), so one slice and one escape covers it all:
@@ -542,7 +533,7 @@ function renderMarkdown(src, env, slugCache) {
       buf.push('</code></pre>\n');
       continue;
     }
-    const hd = headingRange(src, pos, end);
+    const hd = c0 === 35 ? headingRange(src, pos, end) : null;
     if (hd !== null) {
       const text = src.slice(hd.a, hd.b);
       let slug = slugCache.get(text);
@@ -554,12 +545,12 @@ function renderMarkdown(src, env, slugCache) {
       pos = end + 1;
       continue;
     }
-    if (isHrRange(src, pos, end)) {
+    if ((c0 === 45 || c0 === 42) && isHrRange(src, pos, end)) {
       buf.push('<hr>\n');
       pos = end + 1;
       continue;
     }
-    if (src.charCodeAt(pos) === 62) { // '>'
+    if (c0 === 62) { // '>'
       const qlines = [];
       while (pos <= total) {
         const e2 = lineEnd(src, pos);
@@ -583,7 +574,6 @@ function renderMarkdown(src, env, slugCache) {
     let isOrdered = false;
     let orderedStart = 1;
     let itemText = '';
-    const c0 = src.charCodeAt(pos);
     if ((c0 === 45 || c0 === 42) && src.charCodeAt(pos + 1) === 32) {
       isBullet = true;
       itemText = src.slice(pos + 2, end);
@@ -649,7 +639,12 @@ function renderMarkdown(src, env, slugCache) {
     pos = end + 1;
     while (pos <= total) {
       const e2 = lineEnd(src, pos);
-      if (endsParaRange(src, pos, e2)) break;
+      if (e2 === pos) break;
+      const cc = src.charCodeAt(pos);
+      if (cc === 32 || cc === 9 ? isBlankRange(src, pos, e2)
+        : cc === 96 ? fenceLangRange(src, pos, e2) !== null
+        : cc === 35 ? headingRange(src, pos, e2) !== null
+        : cc === 45 || cc === 42 ? isHrRange(src, pos, e2) : false) break;
       [ta, tb] = trimRange(src, pos, e2);
       if (ta !== pos || tb !== e2) dirty = true;
       segs.push(ta, tb);
@@ -890,11 +885,17 @@ function renderNodes(nodes, S, ctx, depth, buf) {
     if (n.k === 0) {
       buf.push(n.text);
     } else if (n.k === 1) {
-      buf.push(escapeHtml(textOf(lk(S, n.path)), ctx.escCache));
+      // textOf inlined for the common string case (titles, urls, dates).
+      const v = lk(S, n.path);
+      buf.push(escapeHtml(typeof v === 'string' ? v : textOf(v), ctx.escCache));
     } else if (n.k === 2) {
-      buf.push(textOf(lk(S, n.path)));
+      const v = lk(S, n.path);
+      buf.push(typeof v === 'string' ? v : textOf(v));
     } else if (n.k === 4) {
-      const v = truthy(lk(S, n.path));
+      // truthy inlined: an array counts when non-empty, else not
+      // undefined, null, false, "", or 0.
+      const vv = lk(S, n.path);
+      const v = Array.isArray(vv) ? vv.length > 0 : vv !== undefined && vv !== null && vv !== false && vv !== '' && vv !== 0;
       const branch = v !== n.not ? n.then : n.els;
       if (branch !== null) renderNodes(branch, S, ctx, depth, buf);
     } else if (n.k === 3) {
@@ -1147,7 +1148,12 @@ export function run(input) {
   }
 
   function pageOf(s) {
-    const card = cardOf(s);
+    // Posts already have their card in `cards` (shared with the index/tag
+    // renders); reusing it avoids rebuilding the same card. The page-only
+    // fields added here (slug, content, toc, newer, older, is_post) are
+    // never read by the index/tag templates, so sharing changes nothing
+    // rendered. Non-posts have no entry and build a fresh card.
+    const card = cards.get(s) ?? cardOf(s);
     card.slug = s.slug;
     card.content = s.html;
     card.toc = s.toc;
